@@ -1,90 +1,175 @@
-
-import torch
-import torch.nn as nn
+import tensorflow as tf
 import tensornetwork as tn
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import Tuple, List
+import time
+from fractions import Fraction
+from math import gcd
 
-class QuantumGate(nn.Module):
-    def __init__(self, n_qubits):
-        super().__init__()
-        self.n_qubits = n_qubits
-        self.unitary = nn.Parameter(torch.randn(2**n_qubits, 2**n_qubits, dtype=torch.cfloat))
+# GPUメモリ使用を制限
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)
 
-    def forward(self, x):
-        return torch.matmul(self.unitary, x)
+print(f"Using TensorFlow version: {tf.__version__}")
+print(f"GPU available: {tf.test.is_gpu_available()}")
 
-class QFT(nn.Module):
-    def __init__(self, n_qubits):
-        super().__init__()
-        self.n_qubits = n_qubits
-        self.gates = nn.ModuleList([QuantumGate(2) for _ in range(n_qubits*(n_qubits-1)//2)])
+tn.set_default_backend("tensorflow")
 
-    def forward(self, x):
-        # Implement QFT using the quantum gates
-        # This is a simplified version and needs to be expanded
-        for gate in self.gates:
-            x = gate(x)
-        return x
+def matrix_power(matrix: tf.Tensor, power: int) -> tf.Tensor:
+    result = tf.eye(matrix.shape[0], dtype=tf.complex128)
+    for _ in range(power):
+        result = tf.matmul(result, matrix)
+    return result
 
-class ShorsAlgorithm(nn.Module):
-    def __init__(self, n_qubits):
-        super().__init__()
-        self.n_qubits = n_qubits
-        self.qft = QFT(n_qubits)
+def create_qft_tensor(n: int) -> tn.Node:
+    i, j = tf.meshgrid(tf.range(2**n, dtype=tf.float64), tf.range(2**n, dtype=tf.float64))
+    angle = 2 * np.pi * i * j / 2**n
+    tensor = tf.complex(tf.cos(angle), tf.sin(angle)) / tf.sqrt(tf.cast(2**n, tf.float64))
+    return tn.Node(tensor)
 
-    def forward(self, x):
-        # Implement Shor's algorithm steps
-        # 1. Initial superposition
-        x = torch.ones(2**self.n_qubits, dtype=torch.cfloat) / (2**(self.n_qubits/2))
-        
-        # 2. Modular exponentiation (simplified)
-        # This step needs to be implemented carefully
-        x = torch.remainder(x, 2)
-        # 3. QFT
-        x = self.qft(x)
-        
-        # 4. Measurement (simplified)
-        prob = torch.abs(x)**2
-        print(prob.sum(dim=0))
-        return prob.sum(dim=0)
+def create_naqft_tensor(n: int) -> tn.Node:
+    i, j = tf.meshgrid(tf.range(2**n, dtype=tf.float64), tf.range(2**n, dtype=tf.float64))
+    phase = tf.reduce_sum([((tf.bitwise.right_shift(tf.cast(i, tf.int32), k) & 1) * 
+                            (tf.bitwise.right_shift(tf.cast(j, tf.int32), k) & 1) * 
+                            2 * np.pi / 2**(k+1)) 
+                           for k in range(n)], axis=0)
+    tensor = tf.complex(tf.cos(phase), tf.sin(phase)) / tf.sqrt(tf.cast(2**n, tf.float64))
+    return tn.Node(tensor)
 
-def path_integral(model, n_paths=1000):
-    results = []
-    for _ in range(n_paths):
-        # Generate random path
-        path = torch.randn(model.n_qubits, dtype=torch.cfloat)
-        path /= torch.norm(path)
-        
-        # Compute action (simplified)
-        action = torch.sum(torch.abs(model(path)))
-        
-        results.append(torch.exp(1j * action))
+def quantum_phase_estimation(U: tn.Node, eigenvector: tn.Node, n_qubits: int, use_naqft: bool = False) -> tn.Node:
+    # 初期状態の準備
+    initial_state = tn.Node(tf.concat([tf.constant([1.0 + 0.j], dtype=tf.complex128), tf.zeros(2**n_qubits - 1, dtype=tf.complex128)], axis=0))
+    state = tn.outer_product(initial_state, eigenvector)
     
-    return torch.mean(torch.stack(results))
+    # 制御Uゲートの適用
+    for i in range(n_qubits):
+        U_power = tn.Node(matrix_power(U.tensor, 2**i))
+        control_U = tn.Node(tf.eye(2**(n_qubits + eigenvector.tensor.shape[0]), dtype=tf.complex128))
+        control_U.tensor = tf.tensor_scatter_nd_update(
+            control_U.tensor, 
+            [[j, j] for j in range(2**n_qubits, 2**(n_qubits + eigenvector.tensor.shape[0]))],
+            tf.reshape(U_power.tensor, [-1])
+        )
+        state = tn.contract_between(control_U, state)
 
-def tensor_network_contraction(model, input_state):
-    # Convert the model and input to a tensor network
-    tn_nodes = []
-    for name, param in model.named_parameters():
-        tn_nodes.append(tn.Node(param.detach().numpy()))
+    # QFTまたはNAQFTの適用
+    if use_naqft:
+        qft = create_naqft_tensor(n_qubits)
+    else:
+        qft = create_qft_tensor(n_qubits)
     
-    input_node = tn.Node(input_state.detach().numpy())
+    qft_full = tn.Node(tf.eye(2**(n_qubits + eigenvector.tensor.shape[0]), dtype=tf.complex128))
+    qft_full.tensor = tf.tensor_scatter_nd_update(
+        qft_full.tensor, 
+        [[i, j] for i in range(2**n_qubits) for j in range(2**n_qubits)],
+        tf.reshape(qft.tensor, [-1])
+    )
+    state = tn.contract_between(qft_full, state)
+
+    return tn.Node(state.tensor[:2**n_qubits])
+
+def measure_state(state: tn.Node) -> int:
+    probabilities = tf.abs(state.tensor)**2
+    return tf.random.categorical(tf.math.log([probabilities]), 1)[0, 0].numpy()
+
+def continued_fraction(x: float, max_denominator: int) -> Fraction:
+    return Fraction(x).limit_denominator(max_denominator)
+
+def shor_algorithm(N: int, a: int, n_qubits: int, use_naqft: bool = False) -> Tuple[int, float]:
+    # Uゲートの定義
+    U_tensor = tf.scatter_nd([[i, (a * i) % N] for i in range(N)], 
+                             tf.ones(N, dtype=tf.complex128),
+                             [N, N])
+    U = tn.Node(U_tensor)
+
+    # 固有ベクトルの準備
+    eigenvector = tn.Node(tf.ones(N, dtype=tf.complex128) / tf.cast(tf.sqrt(tf.cast(N, tf.float64)), tf.complex128))
+
+    # 量子位相推定
+    start_time = time.time()
+    final_state = quantum_phase_estimation(U, eigenvector, n_qubits, use_naqft)
+    measured_value = measure_state(final_state)
+    phase = measured_value / 2**n_qubits
+
+    # 連分数展開
+    fraction = continued_fraction(phase, N)
+    r = fraction.denominator
+    end_time = time.time()
+
+    # rが偶数でない場合、もしくはa^(r/2) ≡ -1 (mod N)の場合、失敗とする
+    if r % 2 != 0 or pow(a, r//2, N) == N - 1:
+        return 0, end_time - start_time
+
+    # 因数を計算
+    factor = gcd(pow(a, r//2, N) - 1, N)
+    return factor, end_time - start_time
+
+def run_shor_experiment(N: int, a: int, n_qubits: int, use_naqft: bool = False) -> Tuple[int, float]:
+    factor, time_taken = shor_algorithm(N, a, n_qubits, use_naqft)
+    return factor, time_taken
+
+def main():
+    N = 15  # 素因数分解する数
+    a = 7   # 互いに素な数
+    n_qubits_range = range(4, 8)  # 4から7量子ビットまでテスト
     
-    # Contract the network (this is a simplified version)
-    result = input_node
-    for node in tn_nodes:
-        result = tn.contract(result, node)
+    standard_results = []
+    naqft_results = []
+
+    for n in n_qubits_range:
+        print(f"Testing with {n} qubits:")
+        
+        standard_factor, standard_time = run_shor_experiment(N, a, n)
+        naqft_factor, naqft_time = run_shor_experiment(N, a, n, use_naqft=True)
+        
+        standard_results.append((n, standard_factor, standard_time))
+        naqft_results.append((n, naqft_factor, naqft_time))
+        
+        print(f"Standard - Factor: {standard_factor}, Time: {standard_time:.4f} seconds")
+        print(f"NAQFT    - Factor: {naqft_factor}, Time: {naqft_time:.4f} seconds")
+        print()
+
+    # 結果のプロット
+    plot_results(standard_results, naqft_results)
+
+def plot_results(standard_results, naqft_results):
+    n_qubits = [r[0] for r in standard_results]
     
-    return torch.from_numpy(result.tensor)
+    std_factors = [r[1] for r in standard_results]
+    naqft_factors = [r[1] for r in naqft_results]
+    
+    std_times = [r[2] for r in standard_results]
+    naqft_times = [r[2] for r in naqft_results]
 
-# Main execution
-n_qubits = 30  # Larger number of qubits
-model = ShorsAlgorithm(n_qubits).cuda()  # Use GPU
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
-# Combine path integral and tensor network approaches
-input_state = torch.randn(2**n_qubits, dtype=torch.cfloat).cuda()
-path_integral_result = path_integral(model)
-tn_result = tensor_network_contraction(model, input_state)
+    ax1.plot(n_qubits, std_factors, 'bo-', label='Standard')
+    ax1.plot(n_qubits, naqft_factors, 'ro-', label='NAQFT')
+    ax1.set_xlabel('Number of Qubits')
+    ax1.set_ylabel('Found Factor')
+    ax1.set_title('Found Factor vs Number of Qubits')
+    ax1.legend()
+    ax1.grid(True)
 
-final_result = path_integral_result * tn_result
+    ax2.plot(n_qubits, std_times, 'bo-', label='Standard')
+    ax2.plot(n_qubits, naqft_times, 'ro-', label='NAQFT')
+    ax2.set_xlabel('Number of Qubits')
+    ax2.set_ylabel('Execution Time (seconds)')
+    ax2.set_title('Execution Time vs Number of Qubits')
+    ax2.legend()
+    ax2.grid(True)
 
-print("Final Result:", final_result)
+    plt.tight_layout()
+    plt.savefig('shor_results.png')
+    plt.close()
+
+    print("\n<ANTARTIFACTLINK identifier='shor-results' type='image/png' title='Shor Algorithm Results' />")
+
+if __name__ == "__main__":
+    main()
